@@ -1,0 +1,209 @@
+name: Deploy and Test on VM
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy-and-test:
+    name: Deploy to VM and Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts || true
+
+    - name: Test SSH connection
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} "echo 'SSH connection successful'"
+
+    - name: Check VM readiness
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        # Проверяем PostgreSQL
+        if ! pg_isready -h localhost -p 5432 &> /dev/null; then
+          echo "PostgreSQL не запущен. Запускаем..."
+          sudo systemctl start postgresql || true
+          sleep 3
+        fi
+        
+        # Проверяем подключение к БД
+        if ! PGPASSWORD=val1dat0r psql -h localhost -U validator -d project-sem-1 -c '\q' &> /dev/null; then
+          echo "База данных не настроена. Выполняем настройку..."
+          sudo -u postgres psql -c "CREATE USER validator WITH PASSWORD 'val1dat0r';" 2>/dev/null || \
+          sudo -u postgres psql -c "ALTER USER validator WITH PASSWORD 'val1dat0r';" 2>/dev/null || true
+          sudo -u postgres psql -c "CREATE DATABASE \"project-sem-1\" OWNER validator;" 2>/dev/null || true
+          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"project-sem-1\" TO validator;" 2>/dev/null || true
+        fi
+        
+        echo "ВМ готова к развертыванию"
+        EOF
+
+    - name: Make scripts executable
+      run: |
+        chmod +x scripts/prepare.sh
+        chmod +x scripts/run.sh
+        chmod +x scripts/tests.sh
+
+    - name: Copy project to VM
+      run: |
+        # Создаем временную директорию для архивации
+        TMP_DIR=$(mktemp -d)
+        cp -r . "$TMP_DIR/project"
+        cd "$TMP_DIR/project"
+        
+        # Удаляем ненужные файлы и директории
+        rm -rf .git .github node_modules *.log project_sem app.log 2>/dev/null || true
+        
+        # Создаем архив проекта
+        cd "$TMP_DIR"
+        tar -czf project.tar.gz project
+        
+        # Копируем архив на ВМ
+        scp -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            project.tar.gz ${{ secrets.USER }}@${{ secrets.HOST }}:~/project-sem-1.tar.gz
+        
+        # Распаковываем на ВМ
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        mkdir -p ~/project-sem-1
+        cd ~/project-sem-1
+        tar -xzf ../project-sem-1.tar.gz
+        mv project/* .
+        rmdir project
+        rm ../project-sem-1.tar.gz
+        chmod +x scripts/*.sh
+        EOF
+        
+        # Удаляем временную директорию
+        rm -rf "$TMP_DIR"
+
+    - name: Deploy application on VM
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        set -e
+        cd ~/project-sem-1
+        
+        # Устанавливаем Go, если его нет
+        if ! command -v go &> /dev/null; then
+          echo "Установка Go..."
+          export PATH=$PATH:/usr/local/go/bin
+          if [ ! -f /usr/local/go/bin/go ]; then
+            wget -q https://go.dev/dl/go1.23.3.linux-amd64.tar.gz
+            sudo rm -rf /usr/local/go
+            sudo tar -C /usr/local -xzf go1.23.3.linux-amd64.tar.gz
+            rm go1.23.3.linux-amd64.tar.gz
+          fi
+        fi
+        
+        export PATH=$PATH:/usr/local/go/bin
+        
+        # Устанавливаем зависимости Go
+        go mod download
+        go mod tidy
+        
+        # Останавливаем старое приложение, если оно запущено
+        pkill -f "./project_sem" || true
+        pkill -f "go run main.go" || true
+        sleep 2
+        
+        # Компилируем приложение
+        echo "Компиляция приложения..."
+        go build -o project_sem main.go
+        
+        # Запускаем приложение в фоне
+        echo "Запуск приложения..."
+        nohup ./project_sem > app.log 2>&1 &
+        
+        # Ждем запуска
+        sleep 5
+        
+        # Проверяем, что приложение запущено
+        if pgrep -f "./project_sem" > /dev/null; then
+          echo "Приложение успешно запущено"
+        else
+          echo "Ошибка: Приложение не запустилось"
+          cat app.log || true
+          exit 1
+        fi
+        
+        # Проверяем доступность API
+        for i in {1..10}; do
+          if curl -s http://localhost:8080/api/v0/prices > /dev/null 2>&1; then
+            echo "API доступен"
+            break
+          fi
+          if [ $i -eq 10 ]; then
+            echo "API недоступен после 10 попыток"
+            cat app.log || true
+            exit 1
+          fi
+          sleep 2
+        done
+        EOF
+
+    - name: Run tests Level 1
+      id: test-level-1
+      continue-on-error: true
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        cd ~/project-sem-1
+        ./scripts/tests.sh 1
+        EOF
+
+    - name: Run tests Level 2
+      id: test-level-2
+      continue-on-error: true
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        cd ~/project-sem-1
+        ./scripts/tests.sh 2
+        EOF
+
+    - name: Run tests Level 3
+      id: test-level-3
+      continue-on-error: true
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        cd ~/project-sem-1
+        ./scripts/tests.sh 3
+        EOF
+
+    - name: Check test results
+      if: always()
+      run: |
+        echo "Test Level 1: ${{ steps.test-level-1.outcome }}"
+        echo "Test Level 2: ${{ steps.test-level-2.outcome }}"
+        echo "Test Level 3: ${{ steps.test-level-3.outcome }}"
+        
+        if [[ "${{ steps.test-level-1.outcome }}" == "success" ]] || \
+           [[ "${{ steps.test-level-2.outcome }}" == "success" ]] || \
+           [[ "${{ steps.test-level-3.outcome }}" == "success" ]]; then
+          echo "At least one test level passed successfully!"
+          exit 0
+        else
+          echo "All test levels failed!"
+          exit 1
+        fi
+
+    - name: Get application logs
+      if: failure()
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.USER }}@${{ secrets.HOST }} bash << 'EOF'
+        cd ~/project-sem-1
+        echo "=== Application logs ==="
+        cat app.log || echo "No log file found"
+        echo ""
+        echo "=== Process status ==="
+        ps aux | grep project_sem || echo "Application not running"
+        EOF
