@@ -208,32 +208,52 @@ func parseCSV(r io.Reader) ([]Price, error) {
 	return prices, nil
 }
 
-func insertPrices(prices []Price) error {
-	query := `INSERT INTO prices (id, name, category, price, create_date) VALUES ($1, $2, $3, $4, $5)`
+func insertPrices(prices []Price) (int, error) {
+	// Открываем транзакцию
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("ошибка начала транзакции: %v", err)
+	}
+	defer tx.Rollback()
+
+	query := `INSERT INTO prices (name, category, price, create_date) VALUES ($1, $2, $3, $4)`
+	insertedCount := 0
 	
+	// В транзакции вставляем записи
 	for _, price := range prices {
-		_, err := db.Exec(query, price.ID, price.Name, price.Category, price.Price, price.CreateDate)
+		_, err := tx.Exec(query, price.Name, price.Category, price.Price, price.CreateDate)
 		if err != nil {
 			log.Printf("Ошибка вставки записи: %v", err)
-			// Продолжаем обработку остальных записей
+			// Откатываем транзакцию при ошибке
+			return 0, fmt.Errorf("ошибка вставки данных: %v", err)
 		}
+		insertedCount++
 	}
 
-	return nil
+	// Коммитим транзакцию
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("ошибка коммита транзакции: %v", err)
+	}
+
+	return insertedCount, nil
 }
 
-func getStats() (Response, error) {
+func getStats(insertedCount int) (Response, error) {
 	var resp Response
 
+	// total_items - количество в текущей загрузке
+	resp.TotalItems = insertedCount
+	
+	// total_categories - общее количество категорий (по всей БД)
+	// total_price - суммарная стоимость всех объектов в базе данных
 	query := `
 		SELECT 
-			COUNT(*) as total_items,
 			COUNT(DISTINCT category) as total_categories,
 			COALESCE(SUM(price), 0) as total_price
 		FROM prices
 	`
-
-	err := db.QueryRow(query).Scan(&resp.TotalItems, &resp.TotalCategories, &resp.TotalPrice)
+	
+	err := db.QueryRow(query).Scan(&resp.TotalCategories, &resp.TotalPrice)
 	if err != nil {
 		return resp, err
 	}
@@ -283,14 +303,14 @@ func postPricesHandler(w http.ResponseWriter, r *http.Request) {
 
 
 	// Вставляем данные в БД
-	err = insertPrices(prices)
+	insertedCount, err := insertPrices(prices)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Ошибка вставки данных: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	// Получаем статистику
-	stats, err := getStats()
+	stats, err := getStats(insertedCount)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Ошибка получения статистики: %v", err), http.StatusInternalServerError)
 		return
@@ -341,6 +361,12 @@ func getPricesHandler(w http.ResponseWriter, r *http.Request) {
 			strconv.FormatFloat(price, 'f', 2, 64),
 			createDate.Format("2006-01-02"),
 		})
+	}
+
+	// Проверяем ошибку после цикла rows.Next()
+	if err = rows.Err(); err != nil {
+		http.Error(w, fmt.Sprintf("Ошибка при чтении данных из БД: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	writer.Flush()
