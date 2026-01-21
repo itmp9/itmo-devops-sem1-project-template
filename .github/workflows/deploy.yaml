@@ -79,8 +79,9 @@ jobs:
         mkdir -p ~/project-sem-1
         cd ~/project-sem-1
         tar -xzf ../project-sem-1.tar.gz
-        mv project/* .
-        rmdir project
+        shopt -s dotglob
+        mv project/* . 2>/dev/null || true
+        rm -rf project
         rm ../project-sem-1.tar.gz
         chmod +x scripts/*.sh
         EOF
@@ -107,6 +108,19 @@ jobs:
         fi
         
         export PATH=$PATH:/usr/local/go/bin
+        
+        # Пересоздаем таблицу с правильной схемой
+        echo "Настройка базы данных..."
+        PGPASSWORD=val1dat0r psql -h localhost -U validator -d project-sem-1 << 'SQL'
+        DROP TABLE IF EXISTS prices CASCADE;
+        CREATE TABLE IF NOT EXISTS prices (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            category VARCHAR(255) NOT NULL,
+            price DECIMAL(10,2) NOT NULL,
+            create_date TIMESTAMP NOT NULL
+        );
+        SQL
         
         # Устанавливаем зависимости Go
         go mod download
